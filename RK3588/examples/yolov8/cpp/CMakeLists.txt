@@ -1,0 +1,352 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(rknn_yolov8)
+
+if (ENABLE_ASAN)
+	message(STATUS "BUILD WITH ADDRESS SANITIZER")
+	set (CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
+	set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
+	set (CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
+endif ()
+
+set(rknpu_yolov8_file rknpu2/yolov8.cc)
+
+if (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103")
+    add_definitions(-DRV1106_1103)
+    set(rknpu_yolov8_file rknpu2/yolov8_rv1106_1103.cc)
+    #dma
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/allocator/dma)
+endif()
+
+if(TARGET_SOC STREQUAL "rk1808" OR TARGET_SOC STREQUAL "rv1109" OR TARGET_SOC STREQUAL "rv1126")
+    add_definitions(-DRKNPU1)
+    set(rknpu_yolov8_file rknpu1/yolov8.cc)
+endif()
+
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/ 3rdparty.out)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../utils/ utils.out)
+
+set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+
+# opencv 路径与 install 已在 ../../../3rdparty/CMakeLists.txt 中处理
+# 这里只需要拿到 lib 列表和 include 路径供 target 使用
+set(OPENCV_INCLUDE_DIR ${OPENCV_INCLUDE_DIR})
+
+add_executable(${PROJECT_NAME}
+    main.cc
+    postprocess.cc
+    ${rknpu_yolov8_file}
+)
+
+target_link_libraries(${PROJECT_NAME}
+    imageutils
+    fileutils
+    imagedrawing    
+    ${LIBRKNNRT}
+    dl
+)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    target_link_libraries(${PROJECT_NAME}
+    log
+)
+endif()
+
+message(STATUS "!!!!!!!!!!!CMAKE_SYSTEM_NAME: ${CMAKE_SYSTEM_NAME}")
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} Threads::Threads)
+endif()
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBRKNNRT_INCLUDES}
+)
+
+
+# 已移除 _zero_copy 和 _video 两个目标:
+#   - _zero_copy: 零拷贝图片检测, 与主 demo 功能重复, 已删除目标 (rknpu2/yolov8_zero_copy.cc 保留, _stream 仍在用)
+#   - _video:     离线视频检测, 依赖 OpenCV videoio→imgcodecs→libpng12, Ubuntu 22.04 无 libpng12 导致链接失败, 功能废弃
+# 注意: rknpu2/yolov8_zero_copy.cc 不可删除, _stream 目标 (见下方) 依赖它做 NPU 零拷贝推理
+
+# 实时视频检测 Demo (摄像头)
+# 自带 V4L2 采集 (v4l2_capture.cc), 不依赖系统 libv4l2, MJPG 解码走 3rdparty/jpeg_turbo
+# 推流支持两种模式:
+#   1. MJPEG-over-HTTP (mjpeg_http_sink.cc, 兼容 mjpg_streamer)
+#   2. RTMP H.264 (rtmp_sink.cc, MPP 硬编码 + librtmp, 搭配 mediamtx WebRTC)
+# 使用 NPU 零拷贝 (rknpu2/yolov8_zero_copy.cc + ZERO_COPY 宏),
+# letterbox 直接写入 rknn_create_mem 出来的 DMA 内存, 省一次 1.2MB memcpy
+#
+# MPP/RTMP 条件编译: 找到 MPP+RTMP 时启用 RTMP 推流, 否则只编译 MJPEG 推流
+set(STREAM_SRCS
+    main_stream.cc
+    postprocess.cc
+    v4l2_capture.cc
+    mjpeg_http_sink.cc
+    llm_agent.cc
+    conf_util.c
+    ../../../3rdparty/cjson/cJSON.c
+    rknpu2/yolov8_zero_copy.cc
+)
+
+# 检测 MPP + RTMP 是否可用 (Linux 平台, 按架构和发行版搜索)
+set(HAVE_MPP_RTMP OFF)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_library(MPP_LIBRARY
+        NAMES rockchip_mpp mpp
+        PATHS /usr/lib/aarch64-linux-gnu
+              /usr/lib/arm-linux-gnueabihf
+              /usr/lib/arm-linux-gnueabi
+              /usr/lib
+              /usr/local/lib
+              ${CMAKE_SYSROOT}/usr/lib
+    )
+    find_library(RTMP_LIBRARY
+        NAMES rtmp
+        PATHS /usr/lib/aarch64-linux-gnu
+              /usr/lib/arm-linux-gnueabihf
+              /usr/lib/arm-linux-gnueabi
+              /usr/lib
+              /usr/local/lib
+              ${CMAKE_SYSROOT}/usr/lib
+    )
+    find_path(MPP_INCLUDE_DIR
+        NAMES rk_mpi.h
+        PATHS /usr/include/rockchip
+              /usr/local/include/rockchip
+              ${CMAKE_SYSROOT}/usr/include/rockchip
+    )
+    if (MPP_LIBRARY AND RTMP_LIBRARY)
+        set(HAVE_MPP_RTMP ON)
+    endif()
+endif()
+
+# RTMP 推流功能: 仅在 MPP+RTMP 都可用时编入
+if (HAVE_MPP_RTMP)
+    list(APPEND STREAM_SRCS rtmp_sink.cc)
+    message(STATUS "RTMP streaming: ENABLED (MPP=${MPP_LIBRARY}, RTMP=${RTMP_LIBRARY})")
+else()
+    message(WARNING "MPP or RTMP not found, RTMP streaming disabled (MJPEG still available)")
+    message(STATUS "  MPP_LIBRARY: ${MPP_LIBRARY}")
+    message(STATUS "  RTMP_LIBRARY: ${RTMP_LIBRARY}")
+endif()
+
+add_executable(${PROJECT_NAME}_stream ${STREAM_SRCS})
+
+# HEADLESS 模式: 去除 OpenCV highgui/videoio 依赖, 适用无头板部署
+# 去除 imshow/waitKey/VideoWriter, 依赖链从 100+ 降到 ~20 个 .so
+option(HEADLESS "Disable OpenCV highgui/videoio for headless streaming (reduces runtime deps)" ON)
+if (HEADLESS)
+    target_compile_definitions(${PROJECT_NAME}_stream PRIVATE HEADLESS)
+    message(STATUS "HEADLESS mode: ON (no OpenCV highgui/videoio, minimal deps)")
+else()
+    message(STATUS "HEADLESS mode: OFF (full OpenCV with highgui/videoio)")
+endif()
+
+target_compile_definitions(${PROJECT_NAME}_stream PRIVATE ZERO_COPY)
+if (HAVE_MPP_RTMP)
+    target_compile_definitions(${PROJECT_NAME}_stream PRIVATE HAVE_MPP_RTMP)
+endif()
+
+# 定位 libturbojpeg.a (只在 linux aarch64/armhf/armhf_uclibc/x64 平台有预编译)
+set(JPEG_TURBO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/jpeg_turbo)
+set(JPEG_TURBO_LIB "")
+# 优先按 TARGET_SOC 选 (避免 rv1106 用到 armhf 那份不兼容的 .a)
+if (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103")
+    set(JPEG_TURBO_LIB ${JPEG_TURBO_DIR}/Linux/armhf_uclibc/libturbojpeg.a)
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    set(JPEG_TURBO_LIB ${JPEG_TURBO_DIR}/Linux/aarch64/libturbojpeg.a)
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm" OR CMAKE_SYSTEM_PROCESSOR MATCHES "armhf")
+    set(JPEG_TURBO_LIB ${JPEG_TURBO_DIR}/Linux/armhf/libturbojpeg.a)
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+    set(JPEG_TURBO_LIB ${JPEG_TURBO_DIR}/Linux/x64/libturbojpeg.a)
+endif()
+
+target_include_directories(${PROJECT_NAME}_stream PRIVATE
+    ${JPEG_TURBO_DIR}/include
+)
+
+target_link_libraries(${PROJECT_NAME}_stream
+    imageutils
+    fileutils
+    imagedrawing
+    ${LIBRKNNRT}
+    dl
+)
+
+# HEADLESS 模式: 只链接 OpenCV core+imgproc+calib3d (无 highgui/videoio 的 GTK3/GStreamer/FFmpeg 依赖链)
+# calib3d 用于畸变矫正 (cv::initUndistortRectifyMap), 它依赖 features2d + flann + imgproc + core
+# 链接顺序: 依赖者在前, 被依赖者在后 (GNU ld 单次扫描)
+if (HEADLESS)
+    target_link_libraries(${PROJECT_NAME}_stream
+        ${OPENCV_LIB_DIR}/libopencv_calib3d.so
+        ${OPENCV_LIB_DIR}/libopencv_features2d.so
+        ${OPENCV_LIB_DIR}/libopencv_flann.so
+        ${OPENCV_LIB_DIR}/libopencv_imgproc.so
+        ${OPENCV_LIB_DIR}/libopencv_core.so
+    )
+else()
+    target_link_libraries(${PROJECT_NAME}_stream ${OPENCV_LIBS})
+endif()
+
+# MPP/RTMP 链接 + 运行时库打包 (仅 HAVE_MPP_RTMP 时)
+if (HAVE_MPP_RTMP)
+    # 定位 OpenSSL 运行时库 (librtmp 依赖 libssl/libcrypto)
+    # 注意1: NAMES 不能含 ssl3, 否则 find_library 会误匹配到 NSS 的 libssl3.so (libnss3 包, 非 OpenSSL)
+    # 注意2: find_library 默认找不到带版本号的 libssl.so.3/libcrypto.so.3
+    #        (只装 libssl3 运行时未装 libssl-dev 时), 用 file(GLOB) 在标准路径兜底
+    #        定位 OpenSSL 3 真身 (libssl3 包提供的 libssl.so.3/libcrypto.so.3)
+    get_filename_component(MPP_LIB_DIR ${MPP_LIBRARY} DIRECTORY)
+    find_library(SSL_LIBRARY
+        NAMES ssl
+        PATHS ${MPP_LIB_DIR} /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib
+    )
+    if (NOT SSL_LIBRARY)
+        file(GLOB _ssl_rt
+            /usr/lib/aarch64-linux-gnu/libssl.so.3*
+            /usr/lib/arm-linux-gnueabihf/libssl.so.3*
+            /usr/lib/libssl.so.3*)
+        if (_ssl_rt)
+            list(GET _ssl_rt 0 SSL_LIBRARY)
+        endif()
+    endif()
+    find_library(CRYPTO_LIBRARY
+        NAMES crypto
+        PATHS ${MPP_LIB_DIR} /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib
+    )
+    if (NOT CRYPTO_LIBRARY)
+        file(GLOB _crypto_rt
+            /usr/lib/aarch64-linux-gnu/libcrypto.so.3*
+            /usr/lib/arm-linux-gnueabihf/libcrypto.so.3*
+            /usr/lib/libcrypto.so.3*)
+        if (_crypto_rt)
+            list(GET _crypto_rt 0 CRYPTO_LIBRARY)
+        endif()
+    endif()
+    message(STATUS "OpenSSL for RTMP: SSL=${SSL_LIBRARY} CRYPTO=${CRYPTO_LIBRARY}")
+    if (NOT SSL_LIBRARY OR NOT CRYPTO_LIBRARY)
+        message(FATAL_ERROR "OpenSSL libssl/libcrypto not found. Install libssl-dev or ensure libssl3 runtime (libssl.so.3/libcrypto.so.3) present.")
+    endif()
+
+    target_link_libraries(${PROJECT_NAME}_stream ${MPP_LIBRARY} ${RTMP_LIBRARY} ${SSL_LIBRARY} ${CRYPTO_LIBRARY})
+    if (MPP_INCLUDE_DIR)
+        target_include_directories(${PROJECT_NAME}_stream PRIVATE ${MPP_INCLUDE_DIR})
+    else()
+        target_include_directories(${PROJECT_NAME}_stream PRIVATE /usr/include/rockchip)
+    endif()
+    # RGA: RGB→NV12 硬件加速 (rtmp_sink.cc 中使用, MPP DMA buffer 做 imcvtcolor)
+    target_include_directories(${PROJECT_NAME}_stream PRIVATE ${LIBRGA_INCLUDES})
+    target_link_libraries(${PROJECT_NAME}_stream ${LIBRGA})
+
+    # 将 MPP/RTMP/SSL/RGA 运行时库打包到 install/lib
+    # 使用 install(CODE) + file(GLOB) 精确安装 .so 文件 (含符号链接), 避免 install(DIRECTORY) 把整个系统 lib 目录树拷贝进来
+    get_filename_component(RTMP_LIB_DIR ${RTMP_LIBRARY} DIRECTORY)
+
+    # MPP .so (librockchip_mpp.so → .so.1 → .so.0)
+    install(CODE "
+        file(GLOB _mpp_so \"${MPP_LIB_DIR}/librockchip_mpp.so*\")
+        file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\" TYPE SHARED_LIBRARY FILES \${_mpp_so})
+    ")
+    # RTMP .so (librtmp.so → .so.1)
+    install(CODE "
+        file(GLOB _rtmp_so \"${RTMP_LIB_DIR}/librtmp.so*\")
+        file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\" TYPE SHARED_LIBRARY FILES \${_rtmp_so})
+    ")
+    # SSL .so
+    if (SSL_LIBRARY)
+        get_filename_component(SSL_LIB_DIR ${SSL_LIBRARY} DIRECTORY)
+        install(CODE "
+            file(GLOB _ssl_so \"${SSL_LIB_DIR}/libssl.so*\")
+            file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\" TYPE SHARED_LIBRARY FILES \${_ssl_so})
+        ")
+    endif()
+    # Crypto .so
+    if (CRYPTO_LIBRARY)
+        get_filename_component(CRYPTO_LIB_DIR ${CRYPTO_LIBRARY} DIRECTORY)
+        install(CODE "
+            file(GLOB _crypto_so \"${CRYPTO_LIB_DIR}/libcrypto.so*\")
+            file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\" TYPE SHARED_LIBRARY FILES \${_crypto_so})
+        ")
+    endif()
+    # RGA 运行时 .so
+    get_filename_component(RGA_LIB_DIR ${LIBRGA} DIRECTORY)
+    install(CODE "
+        file(GLOB _rga_so \"${RGA_LIB_DIR}/librga.so*\")
+        file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\" TYPE SHARED_LIBRARY FILES \${_rga_so})
+    ")
+
+    # mediamtx (RTMP→WebRTC 流媒体服务器, 静态链接 Go 二进制)
+    # CMAKE_SOURCE_DIR 是 examples/yolov8/cpp, 所以向上 3 级找项目根
+    get_filename_component(PROJ_ROOT "${CMAKE_SOURCE_DIR}/../../.." ABSOLUTE)
+    if (EXISTS ${PROJ_ROOT}/mediamtx)
+        install(PROGRAMS ${PROJ_ROOT}/mediamtx DESTINATION .)
+        if (EXISTS ${PROJ_ROOT}/mediamtx.yml)
+            install(FILES ${PROJ_ROOT}/mediamtx.yml DESTINATION .)
+            message(STATUS "mediamtx: will be installed from ${PROJ_ROOT}/mediamtx (with mediamtx.yml)")
+        else()
+            message(STATUS "mediamtx: will be installed from ${PROJ_ROOT}/mediamtx (mediamtx.yml not found, skip)")
+        endif()
+    else()
+        message(STATUS "mediamtx: not found at ${PROJ_ROOT}/mediamtx (skip)")
+    endif()
+endif()
+
+if (JPEG_TURBO_LIB AND EXISTS ${JPEG_TURBO_LIB})
+    message(STATUS "Linking libturbojpeg: ${JPEG_TURBO_LIB}")
+    target_link_libraries(${PROJECT_NAME}_stream ${JPEG_TURBO_LIB})
+else()
+    message(WARNING "libturbojpeg.a not found for ${CMAKE_SYSTEM_PROCESSOR}, YUYV fallback only")
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    target_link_libraries(${PROJECT_NAME}_stream log)
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME}_stream Threads::Threads)
+endif()
+
+target_include_directories(${PROJECT_NAME}_stream PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${LIBRKNNRT_INCLUDES}
+    ${OPENCV_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/cjson
+)
+
+# libcurl: LLM 问答服务调用 DeepSeek vision API (板端系统库, aarch64 本机编译时直连)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_library(CURL_LIBRARY
+        NAMES curl
+        PATHS /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf /usr/lib /usr/local/lib
+    )
+    if (NOT CURL_LIBRARY)
+        message(FATAL_ERROR "libcurl not found (install libcurl4-openssl-dev)")
+    endif()
+    message(STATUS "Linking libcurl: ${CURL_LIBRARY}")
+    target_link_libraries(${PROJECT_NAME}_stream ${CURL_LIBRARY})
+endif()
+install(TARGETS ${PROJECT_NAME}_stream DESTINATION .)
+
+install(TARGETS ${PROJECT_NAME} DESTINATION .)
+
+# UDP<->UART 车控转发 (原 uart/udp_uart1.c, 参数同样收敛到 ./llm.conf)
+add_executable(rknn_udp_uart
+    udp_uart1.c
+    conf_util.c
+)
+target_include_directories(rknn_udp_uart PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+install(TARGETS rknn_udp_uart DESTINATION .)
+
+# 安装启动脚本 (设置 LD_LIBRARY_PATH, 解决 OpenCV .so 残留构建路径 RUNPATH 的问题)
+get_filename_component(PROJ_ROOT2 "${CMAKE_SOURCE_DIR}/../../.." ABSOLUTE)
+if (EXISTS ${PROJ_ROOT2}/run.sh)
+    install(PROGRAMS ${PROJ_ROOT2}/run.sh DESTINATION .)
+endif()
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../model/bus.jpg DESTINATION model)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../model/coco_80_labels_list.txt DESTINATION model)
+file(GLOB RKNN_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../model/*.rknn")
+install(FILES ${RKNN_FILES} DESTINATION model)
